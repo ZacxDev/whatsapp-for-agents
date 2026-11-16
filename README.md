@@ -93,6 +93,70 @@ store at all:
 docker compose --profile media up -d
 ```
 
+## Running it directly (no Docker)
+
+Nothing here depends on a container: the code wants a Postgres DSN and an S3
+endpoint, both by environment variable.
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .                        # or: pip install -r requirements.txt
+
+export WHATSAPP_PG_DSN='postgresql://whatsapp_app:...@127.0.0.1:5432/whatsapp'
+export WHATSAPP_HMAC_KEY=...            # must match wuzapi's — global AND per-user
+export MINIO_ARCHIVE_ENDPOINT=http://127.0.0.1:9000
+export MINIO_ARCHIVE_ACCESS_KEY=... MINIO_ARCHIVE_SECRET_KEY=...
+
+whatsapp-for-agents init-schema         # applies the `whatsapp` schema
+whatsapp-for-agents conversations --limit 20
+whatsapp-for-agents search "deposit"
+whatsapp-for-agents show '15550000001@s.whatsapp.net'
+whatsapp-for-agents-sender ls
+```
+
+`init-schema` comes from the module that owns the DDL, so there is no separate
+migration file to keep in sync. Drop the `MINIO_ARCHIVE_*` variables and the archive
+still works — message rows are stored, media is recorded as failed rather than
+fetched.
+
+## Running it with Nix
+
+The flake is a second supported build path, not an afterthought:
+
+```bash
+nix run github:ZacxDev/whatsapp-for-agents -- conversations --limit 20
+
+nix build .#consumer-image              # the read half, as an OCI image
+nix build .#sender-image                # the send half
+docker load -i result
+
+nix build .#checks.x86_64-linux.tests   # the hermetic suite, in the sandbox
+nix develop                             # python3 + psycopg2 + minio + pytest
+```
+
+As a flake input:
+
+```nix
+{
+  inputs.whatsapp-for-agents.url = "github:ZacxDev/whatsapp-for-agents";
+  # provides, per system:
+  #   packages.whatsapp-for-agents   the operator CLI
+  #   packages.consumer-image        the read half, as an image
+  #   packages.sender-image          the send half
+  #   checks.tests                   the hermetic suite
+  #   devShells.default
+}
+```
+
+🔴 **The split survives the Nix path, and that took saying.** The consumer and
+sender module sets are declared in `flake.nix`, and their disjointness is asserted
+at **eval time** — so a `nix build` of anything in the flake fails before compiling
+if either set drifts into the other. Three guards now cover this property from three
+angles: `tests/test_image_split.py` reads the Dockerfiles' `COPY` lines, the flake
+checks its own declaration, and CI reads the **built** images' `/app` listing — which
+is the only one of the three that inspects what actually lands in an image rather
+than a declaration of intent.
+
 ### Sending
 
 ```bash
@@ -155,6 +219,15 @@ Everything below was run against the code in this repo, not reasoned about:
   `WHATSAPP_SENDER_HEARTBEAT`, with *different* values — so with that variable unset,
   the probe looked for a file nobody wrote and the pod reported unhealthy forever.
   Measured: **HTTP 503 before, HTTP 200 after.**
+- **Both Nix images build**, and their `/app` listings are exactly the disjoint module
+  sets — `consumer.py _wa_db.py _wa_parse.py _wa_webhook.py _minio.py` and
+  `sender.py _wa_outbound.py _wa_db.py`. Asserted in CI against the *built* images.
+- **The flake's split guard fires**: injecting `sender.py` into the consumer's module
+  set makes `nix build` fail at eval time with the guard's message, before anything
+  compiles.
+- **A Nix-built consumer image works**: it applied the `whatsapp` schema to a real
+  Postgres and answered `conversations` and `stats --json` from it — the same code
+  path the Docker image takes.
 
 ---
 

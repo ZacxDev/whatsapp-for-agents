@@ -84,3 +84,62 @@ jobs:
             echo "::error::a test module skipped — expected 0 skips with WHATSAPP_TEST_DSN set"
             exit 1
           fi
+
+  # The FLAKE is a second build path, so it is a second chance to lose the
+  # property the repo exists for — the consumer image must carry no send code.
+  # `tests/test_image_split.py` guards that for the Dockerfiles, and the flake
+  # asserts the same disjointness at EVAL time; this job checks the thing neither
+  # of those can: what actually lands in the built image at /app.
+  flake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: The flake evaluates (its split guard included)
+        run: nix flake show
+
+      # `checks.tests` is the hermetic suite, run the way a consumer of the flake
+      # would run it. ⚠ It does NOT claim the 0-skip result above: a Nix check has
+      # no Postgres, so the two DSN-gated modules skip. What it does enforce is
+      # that nothing ELSE skips.
+      - name: The Nix check
+        run: nix build -L .#checks.x86_64-linux.tests
+
+      - name: Build both images
+        run: |
+          nix build .#packages.x86_64-linux.consumer-image --out-link /tmp/consumer.tar.gz
+          nix build .#packages.x86_64-linux.sender-image --out-link /tmp/sender.tar.gz
+          docker load -i /tmp/consumer.tar.gz
+          docker load -i /tmp/sender.tar.gz
+
+      # 🔴 The assertion neither `test_image_split.py` nor the flake's eval-time
+      # guard makes: read the BUILT image's file list. Both of those check a
+      # DECLARATION (a Dockerfile's COPY lines, a set in the flake); this checks
+      # what a parser bug could actually import at runtime.
+      - name: The built images keep the module split
+        run: |
+          set -euo pipefail
+          CIPY=$(docker inspect whatsapp-for-agents-consumer:0.1.0 --format '{{index .Config.Cmd 0}}')
+          SIPY=$(docker inspect whatsapp-for-agents-sender:0.1.0 --format '{{index .Config.Cmd 0}}')
+          C=$(docker run --rm --entrypoint "$CIPY" whatsapp-for-agents-consumer:0.1.0 \
+                -c "import os; print(' '.join(sorted(os.listdir('/app'))))")
+          S=$(docker run --rm --entrypoint "$SIPY" whatsapp-for-agents-sender:0.1.0 \
+                -c "import os; print(' '.join(sorted(os.listdir('/app'))))")
+          echo "consumer /app: $C"
+          echo "sender   /app: $S"
+          case " $C " in
+            *" sender.py "*|*" _wa_outbound.py "*)
+              echo "::error::the consumer image ships SEND code — a parser bug could reach a send endpoint"; exit 1 ;;
+          esac
+          case " $S " in
+            *" consumer.py "*|*" _wa_parse.py "*|*" _wa_webhook.py "*|*" _minio.py "*)
+              echo "::error::the sender image ships INGEST code — it is meant to be a tiny auditable surface"; exit 1 ;;
+          esac
+          case " $C " in *" _wa_db.py "*) ;; *) echo "::error::the consumer image lost _wa_db.py"; exit 1 ;; esac
+          case " $S " in *" _wa_db.py "*) ;; *) echo "::error::the sender image lost _wa_db.py"; exit 1 ;; esac
+          echo "split holds in both built images"

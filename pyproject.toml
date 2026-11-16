@@ -1,0 +1,53 @@
+# Packaging metadata. What this buys: `nix run`, `nix build`, and a plain
+# `pip install .` all produce the two CLI entry points below.
+#
+# 🔴 THE MODULES STAY AT THE REPO ROOT, and that is deliberate. They import each
+# other by bare name (`from _wa_db import …`) after putting their own directory on
+# sys.path, and the test modules depend on that arrangement. Moving them into a
+# package directory would mean touching every import in the repo for no
+# behavioural gain, so `py-modules` names each file instead.
+#
+# 🔴 INSTALLING THIS INSTALLS BOTH HALVES, which is right for the operator CLI
+# (`whatsapp-for-agents`, run on a laptop against WHATSAPP_PG_DSN) and WRONG for a
+# pod: the whole point of the deployment is that the consumer image carries no send
+# code. The images are built from disjoint subsets — see `flake.nix`, where the two
+# module sets are declared and asserted disjoint, and `tests/test_image_split.py`,
+# which guards the same property for the Docker path.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whatsapp-for-agents"
+version = "0.1.0"
+description = "A durable WhatsApp archive your agent can query — with sending a human must approve"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  "psycopg2-binary",   # _wa_db: Postgres client
+  "minio",             # _minio: S3 client for the media archive
+]
+
+[project.scripts]
+whatsapp-for-agents = "consumer:main"
+whatsapp-for-agents-sender = "sender:main"
+
+[project.urls]
+Source = "https://github.com/ZacxDev/whatsapp-for-agents"
+
+[tool.setuptools]
+py-modules = [
+  "consumer",
+  "sender",
+  "_wa_db",
+  "_wa_parse",
+  "_wa_webhook",
+  "_wa_outbound",
+  "_minio",
+]
