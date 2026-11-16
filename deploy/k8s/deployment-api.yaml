@@ -1,0 +1,162 @@
+---
+# wuzapi — the WhatsApp multi-device daemon (whatsmeow behind a REST API).
+# It holds the linked-device session and is the only pod that speaks the WhatsApp
+# protocol; the other two pods talk to it over this cluster's network, never to
+# WhatsApp.
+#
+# 🔴 `replicas: 1` AND `strategy: Recreate` ARE A HARD CONSTRAINT, NOT CAPACITY
+# TUNING. A WhatsApp linked device holds device credentials and ratchet state that
+# assume a single writer; two pods would both connect, and WhatsApp treats a second
+# connection for the same device identity as a compromise — the failure is a logout
+# or a device removal, not a merge. `Recreate` is required because `RollingUpdate`
+# would run two pods AT ONCE by definition, which is the exact thing being
+# forbidden. Never scale this, and never run a second client against the same
+# session.
+#
+# 🔴 THE IMAGE IS NOT PINNED HERE, WHICH IS A DELIBERATE PLACEHOLDER. A real
+# deployment should pin `asternic/wuzapi` by digest (`image: asternic/wuzapi@sha256:…`).
+# Upstream ships protocol fixes between releases and WhatsApp's protocol rotates,
+# so a bump is a deliberate, reviewed act: change the digest, then verify the
+# session reconnects afterwards.
+#
+# 🔴 THE PROBES ARE TCP, NOT `/session/status`. Upstream documents that endpoint,
+# but it answers "is the session connected", which is NOT liveness: a session
+# legitimately sits disconnected for hours after the phone has been offline, so a
+# probe on it would restart the pod in a loop, reconnecting every time. A TCP probe
+# on the listener answers the question a probe can actually answer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-api
+  namespace: whatsapp
+  labels:
+    app: whatsapp-api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: whatsapp-api
+  template:
+    metadata:
+      labels:
+        app: whatsapp-api
+    spec:
+      containers:
+        - name: wuzapi
+          image: asternic/wuzapi:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # -- Postgres: the SESSION STORE, in the `wuzapi` database that the
+            # db-init Job creates. Session keys live here rather than on a PVC, so
+            # a Postgres restore restores the WhatsApp device — which is why the
+            # backup CronJob is not optional.
+            #
+            # 🔴 THIS CREDENTIAL IS NOT THE APP ROLE. The daemon needs the session
+            # database; the consumer and the sender must not be able to reach it.
+            # See the role split in README.md.
+            - name: DB_HOST
+              value: CHANGE-ME-postgres-host
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: wuzapi
+            - name: DB_USER
+              value: CHANGE-ME-pg-admin-role
+            # 🔴 A `secretKeyRef` IS ALWAYS RESOLVED IN THE REFERENCING POD'S
+            # NAMESPACE — it cannot name a Secret in another namespace. So the
+            # credential has to exist as a Secret in `whatsapp`, not as a
+            # reference to wherever it is otherwise kept.
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-pg-admin
+                  key: password
+            # Set this to what your server requires (`require` / `verify-full`)
+            # if your PostgreSQL has TLS. `false` is not a recommendation here,
+            # just the plaintext default; on the pod network, upgrading it without
+            # a matching server config would simply fail the connection.
+            - name: DB_SSLMODE
+              value: "false"
+
+            # -- Identity / crypto. Absent, wuzapi auto-generates these and loses
+            # them on restart, taking the linked session with it. Set them BEFORE
+            # the first pairing.
+            - name: WUZAPI_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-auth
+                  key: WUZAPI_ADMIN_TOKEN
+            - name: WUZAPI_GLOBAL_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-auth
+                  key: WUZAPI_GLOBAL_ENCRYPTION_KEY
+
+            # -- Webhook. HMAC signing is what lets the consumer refuse a forged
+            # delivery. It verifies with the SAME Secret key, under its own env
+            # name, so there is one value to change — but ⚠ wuzapi's PER-USER
+            # signing key is a separate setting (`POST /session/hmac/config`) and
+            # must hold this same value. See README.md §5.
+            - name: WUZAPI_GLOBAL_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-auth
+                  key: WUZAPI_GLOBAL_HMAC_KEY
+            - name: WUZAPI_GLOBAL_WEBHOOK
+              value: http://whatsapp-consumer.whatsapp.svc.cluster.local:8080/hook
+            - name: WEBHOOK_FORMAT
+              value: json
+            - name: WEBHOOK_RETRY_ENABLED
+              value: "true"
+            - name: WEBHOOK_RETRY_COUNT
+              value: "3"
+            - name: WEBHOOK_RETRY_DELAY_SECONDS
+              value: "30"
+
+            # 🔴 `unavailable`, NOT the upstream default of `available`.
+            # With `available`, the linked companion announces presence and the
+            # primary phone can STOP RECEIVING PUSH NOTIFICATIONS — a silent
+            # quality-of-life regression on the operator's own phone, which is
+            # exactly the sort of thing that gets an integration unplugged a week
+            # later. `unavailable` keeps the companion quiet.
+            - name: WUZAPI_AUTO_PRESENCE
+              value: "unavailable"
+
+            - name: WUZAPI_PORT
+              value: "8080"
+            # Large media is decoded through a temp file; keep it on the emptyDir
+            # rather than the container filesystem.
+            - name: WUZAPI_MEDIA_TMPDIR
+              value: /tmp
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "192Mi"
+            limits:
+              cpu: "1"
+              memory: "768Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,20 @@
+---
+# Operator access to wuzapi's admin/session API (user creation, the QR, status).
+# ClusterIP only: this is reachable with `kubectl port-forward`, which is how the
+# pairing runbook drives it. Nothing outside the cluster can reach a QR endpoint
+# that hands out a link to the operator's WhatsApp account.
+apiVersion: v1
+kind: Service
+metadata:
+  name: whatsapp-api
+  namespace: whatsapp
+  labels:
+    app: whatsapp-api
+spec:
+  type: ClusterIP
+  selector:
+    app: whatsapp-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

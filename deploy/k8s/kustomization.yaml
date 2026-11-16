@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Everything lands in the namespace the Secret refs and the in-cluster DNS names
+# assume (`whatsapp`). See namespace.yaml before renaming it.
+namespace: whatsapp
+resources:
+  - namespace.yaml
+  # 🔴 Placeholder credentials — replace the values (or drop this file and create
+  # the Secrets out of band) before deploying. See README.md.
+  - secrets.yaml
+  - db-init-job.yaml
+  - schema-init-job.yaml
+  - deployment-api.yaml
+  - service-api.yaml
+  - deployment-consumer.yaml
+  - service-consumer.yaml
+  - deployment-sender.yaml
+  - backup-cronjob.yaml

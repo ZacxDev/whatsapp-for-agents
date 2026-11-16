@@ -1,0 +1,11 @@
+# Runtime dependencies — what the consumer and sender IMAGES install.
+#
+# The hermetic suite needs psycopg2 (imported by _wa_db) and NOTHING else: every
+# transport is injectable. minio is needed only for the real media archive.
+#
+# 🔴 Deliberately UNPINNED. For a deployment, pin the IMAGE DIGEST rather than
+# these ranges: a rebuilt tag that picked up a new psycopg2 is a different
+# digest, and therefore a different thing to approve and roll back.
+
+psycopg2-binary          # _wa_db: Postgres client
+minio                    # _minio: S3 client for the media archive

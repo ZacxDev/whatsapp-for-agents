@@ -1,0 +1,20 @@
+---
+# The consumer's webhook endpoint. ClusterIP only — its only legitimate caller is
+# wuzapi in the same namespace. The HMAC signature is the authentication, so this
+# does not need to be private for safety; it is private because nothing else has
+# any business posting to it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: whatsapp-consumer
+  namespace: whatsapp
+  labels:
+    app: whatsapp-consumer
+spec:
+  type: ClusterIP
+  selector:
+    app: whatsapp-consumer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

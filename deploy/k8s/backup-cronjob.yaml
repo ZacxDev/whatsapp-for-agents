@@ -1,0 +1,262 @@
+---
+# Nightly backup of the WhatsApp bridge: the message ARCHIVE and the linked-device
+# SESSION credentials.
+#
+# 🔴 THERE ARE TWO THINGS TO BACK UP AND THEY ARE NOT THE SAME KIND OF THING.
+#
+#   1. the archive database, schema `whatsapp` — the messages. Losing it loses
+#      data that CANNOT be re-fetched: WhatsApp deletes a history sync server-side
+#      once it is delivered, so re-pairing yields nothing.
+#   2. the `wuzapi` database — the linked-device CREDENTIALS. Whoever holds these
+#      can act as the linked device. Losing it means re-pairing, which is
+#      recoverable but costs the session and any history since the last sync.
+#
+# 🔴 THE ARTIFACT IS ENCRYPTED CLIENT-SIDE, IN THIS POD, BEFORE IT LEAVES.
+# The session half is account-takeover material, so the plaintext never touches
+# node disk and never reaches the object store: the dumps are produced and streamed
+# straight into `age` for the recipient in `whatsapp-backup-s3`, and the work dir is
+# memory-backed. Keep the matching PRIVATE key off the cluster and off the object
+# store; the encryption protects nothing otherwise.
+#
+# 🔴 THE DUMP IS ASSERTED TO CONTAIN THE THINGS THAT MATTER, not merely to exist.
+# A `pg_dump` that succeeds against the wrong database, or against an empty schema,
+# produces a PERFECTLY VALID file — and a backup job that only checks "the upload
+# worked" would report green over a backup of nothing. So before encrypting, the
+# job requires `whatsapp.messages` in the archive dump AND `whatsmeow_device` in
+# the session dump, and fails loudly otherwise. Those two names are the load-bearing
+# halves: the first is the data, the second is the ability to keep receiving.
+# (`whatsmeow_device` is wuzapi's own session table; if upstream ever renames it,
+# this job goes red rather than silently backing up the wrong thing.)
+#
+# This job runs with the BROADER Postgres role (`whatsapp-pg-admin`) because it
+# reads BOTH databases — the app role cannot reach the session database at all.
+#
+# RESTORE (scale whatsapp-consumer and whatsapp-api to 0 first):
+#   mc cp <alias>/<bucket>/whatsapp/<TS>.tar.gz.age .
+#   age -d -i <your-age-identity> <TS>.tar.gz.age | tar -xz
+#   psql -d <archive-database> -f archive.sql    # archive: whatsapp schema
+#   psql -d wuzapi             -f session.sql    # session (the daemon must be down)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: whatsapp-backup
+  namespace: whatsapp
+  labels:
+    app.kubernetes.io/name: whatsapp-backup
+    app.kubernetes.io/component: backup
+spec:
+  # 04:00 UTC: a quiet hour, so the dumps do not contend with the daytime
+  # webhook traffic. Change it to suit your own schedule.
+  schedule: "0 4 * * *"
+  timeZone: Etc/UTC
+  # Never let two backups overlap — the scratch volume would be shared.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: whatsapp-backup
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          # 🔴 Images below are referenced by TAG here; pin them by digest in a
+          # real deployment (see README.md).
+          securityContext:
+            # 🔴 ONE UID FOR EVERY CONTAINER, because they share emptyDir volumes.
+            # `runAsNonRoot` alone is NOT enough: it requires the image to declare a
+            # non-root user, and `alpine` declares none — so the age stage fails
+            # with
+            #   Error: container has runAsNonRoot and image will run as root
+            # Pinning runAsUser/runAsGroup means /tools and /scratch are writable by
+            # every stage without an fsGroup, and no stage needs root. The postgres
+            # image is only used for `pg_dump`, a client, so uid 1000 is fine for
+            # it too.
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          initContainers:
+            - name: age-bin
+              image: docker.io/library/alpine:3.22
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  cd /tools
+                  wget -q -O age.tgz "https://github.com/FiloSottile/age/releases/download/v1.2.1/age-v1.2.1-linux-amd64.tar.gz"
+                  # The tarball is refused unless its sha256 matches the pin. 🔴 The
+                  # version and the hash are one unit: bumping the URL without the
+                  # hash (or vice versa) fails here, deliberately.
+                  echo "7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50  age.tgz" | sha256sum -c -
+                  tar -xzf age.tgz age/age
+                  mv age/age ./age-bin && rmdir age && rm age.tgz && mv age-bin age
+                  ./age --version
+              volumeMounts:
+                - name: tools
+                  mountPath: /tools
+              resources:
+                requests: {cpu: 20m, memory: 32Mi}
+                limits: {cpu: 500m, memory: 128Mi}
+            - name: dump
+              image: docker.io/library/postgres:16-alpine
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)
+                  OUT="/scratch/whatsapp-${TS}.tar.gz.age"
+
+                  echo "dumping archive schema (whatsapp) ..."
+                  pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$APP_DATABASE" \
+                    --schema=whatsapp --no-owner --no-privileges > /scratch/archive.sql
+
+                  echo "dumping session database (wuzapi) ..."
+                  pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$SESSION_DATABASE" \
+                    --no-owner --no-privileges > /scratch/session.sql
+
+                  # 🔴 CONTENT ASSERTIONS. A dump of the WRONG database, or of an
+                  # empty schema, is a perfectly valid file — and a job that only
+                  # checks the upload would report green over a backup of nothing.
+                  for pair in "archive.sql:whatsapp.messages" "session.sql:whatsmeow_device"; do
+                    f=${pair%%:*}; want=${pair#*:}
+                    if ! grep -q "$want" "/scratch/$f"; then
+                      echo "FATAL: /scratch/$f does not mention $want — wrong database or empty dump" >&2
+                      exit 1
+                    fi
+                  done
+                  ARCH_BYTES=$(wc -c < /scratch/archive.sql)
+                  SESS_BYTES=$(wc -c < /scratch/session.sql)
+                  echo "archive ${ARCH_BYTES} bytes, session ${SESS_BYTES} bytes"
+
+                  tar -czf - -C /scratch archive.sql session.sql \
+                    | /tools/age -r "$AGE_RECIPIENT" -o "$OUT"
+                  printf '%s' "$TS" > /scratch/timestamp
+                  echo "encrypted: $OUT ($(wc -c < "$OUT") bytes)"
+              env:
+                - name: PGHOST
+                  value: CHANGE-ME-postgres-host
+                - name: PGPORT
+                  value: "5432"
+                # The broader role: this job reads both databases.
+                - name: PGUSER
+                  value: CHANGE-ME-pg-admin-role
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: whatsapp-pg-admin
+                      key: password
+                # The database that holds schema `whatsapp`, and wuzapi's own.
+                - name: APP_DATABASE
+                  value: whatsapp
+                - name: SESSION_DATABASE
+                  value: wuzapi
+                - name: AGE_RECIPIENT
+                  valueFrom:
+                    secretKeyRef:
+                      name: whatsapp-backup-s3
+                      key: AGE_RECIPIENT
+              volumeMounts:
+                - name: scratch
+                  mountPath: /scratch
+                - name: tools
+                  mountPath: /tools
+                  readOnly: true
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {cpu: "1", memory: 512Mi}
+          containers:
+            - name: upload
+              image: docker.io/minio/mc:latest
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  MC="mc --config-dir /scratch/.mc"
+                  TIMESTAMP=$(cat /scratch/timestamp)
+                  ART="/scratch/whatsapp-${TIMESTAMP}.tar.gz.age"
+                  OBJ="${BACKUP_BUCKET}/whatsapp/${TIMESTAMP}.tar.gz.age"
+
+                  # Refuse anything that is not an age file, before it is uploaded.
+                  [ "$(head -c 21 "$ART")" = "age-encryption.org/v1" ] \
+                    || { echo "FATAL: artifact is not age-encrypted"; exit 1; }
+
+                  LOCAL=$(wc -c < "$ART")
+                  if [ "$LOCAL" -lt "${MIN_BYTES}" ]; then
+                    echo "FATAL: archive is ${LOCAL} bytes, below the ${MIN_BYTES}-byte floor"; exit 1
+                  fi
+
+                  $MC alias set backup "${S3_ENDPOINT}" "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" >/dev/null
+                  $MC --quiet cp "$ART" "backup/${OBJ}"
+
+                  # Verify by what the SERVER reports, not by the upload exiting 0.
+                  # No sed/grep in this image, so parse by parameter expansion; a
+                  # missing "size" leaves REMOTE empty, which fails the compare.
+                  STAT=$($MC --json stat "backup/${OBJ}")
+                  REMOTE=${STAT#*\"size\":}
+                  REMOTE=${REMOTE%%[!0-9]*}
+                  if [ "${REMOTE}" != "${LOCAL}" ]; then
+                    echo "FATAL: server reports ${REMOTE:-nothing} bytes, uploaded ${LOCAL}"; exit 1
+                  fi
+                  echo "Uploaded ${OBJ} (${REMOTE} bytes, verified by stat)"
+
+                  # Retention: prune this prefix's artifacts older than the window.
+                  $MC find "backup/${BACKUP_BUCKET}/whatsapp/" --older-than "${RETENTION}" \
+                    --exec "mc --config-dir /scratch/.mc rm {}" 2>/dev/null || true
+              env:
+                # A tiny floor on purpose: the archive is text, so a few hundred KB
+                # is normal and the useful signal is a file that is implausibly
+                # SMALL. The content assertions above are the real check.
+                - name: MIN_BYTES
+                  value: "20000"
+                # Target bucket and how long an artifact is kept.
+                - name: BACKUP_BUCKET
+                  value: whatsapp-backups
+                - name: RETENTION
+                  value: 14d
+                - name: S3_ENDPOINT
+                  value: http://CHANGE-ME-minio-host:9000
+                - name: S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: whatsapp-backup-s3
+                      key: S3_ACCESS_KEY
+                - name: S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: whatsapp-backup-s3
+                      key: S3_SECRET_KEY
+              volumeMounts:
+                - name: scratch
+                  mountPath: /scratch
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi}
+          volumes:
+            - name: tools
+              emptyDir:
+                sizeLimit: 64Mi
+            - name: scratch
+              # Memory-backed: the plaintext dumps must never touch node disk, and
+              # the session dump is account-takeover material.
+              emptyDir:
+                medium: Memory
+                sizeLimit: 512Mi

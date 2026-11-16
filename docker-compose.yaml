@@ -1,0 +1,193 @@
+# whatsapp-for-agents — the single-host stack.
+#
+#   1.  cp .env.example .env   and fill it in
+#   2.  docker compose up -d postgres      # + `--profile media` for object storage
+#   3.  docker compose run --rm consumer python3 consumer.py init-schema
+#   4.  docker compose up -d
+#   5.  link the device — see docs/pairing.md, which is the step that has an order
+#
+# --------------------------------------------------------------------------- #
+# 🔴 READ THIS BEFORE CHANGING ANY OF IT
+#
+# This file is for EVALUATION and small single-host runs. It does NOT reproduce
+# the Kubernetes deployment's isolation in full — there is one .env, not one
+# credential per pod. The split that MATTERS is preserved (see the Postgres
+# bootstrap) because it is the one that keeps a compromised ingester away from the
+# linked-device session keys.
+#
+# 🔴 NEVER run two consumers, two senders, or a second daemon against one linked
+# device. WhatsApp treats a second connection for one device identity as a
+# COMPROMISE, and the outcome is a logout or a device removal — not a merge. That
+# is also why the Kubernetes manifests use `strategy: Recreate` rather than a
+# rolling update.
+# --------------------------------------------------------------------------- #
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      # Read by deploy/postgres/init/01-databases.sh, which runs once.
+      WHATSAPP_APP_PASSWORD: ${WHATSAPP_APP_PASSWORD:?set WHATSAPP_APP_PASSWORD in .env}
+      WUZAPI_DB_PASSWORD: ${WUZAPI_DB_PASSWORD:?set WUZAPI_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # Object storage — OPTIONAL, profile `media`.
+  #
+  # 🔴 WHY IT IS NOT ON BY DEFAULT. MinIO withdrew its published community images:
+  # as of 2026-11, both `minio/minio` (Docker Hub) and `quay.io/minio/minio` refuse
+  # to pull, while nearby namespaces on the same registries pull fine — so a
+  # quickstart that hard-depends on them breaks at the first step. Verified, not
+  # assumed.
+  #
+  # The archive does not need an object store. Message ROWS are stored either way;
+  # without one, an attachment is recorded with `download_error` set and the
+  # message stands. So the default `up` is Postgres and the three pods, and media
+  # is opt-in:
+  #
+  #     docker compose --profile media up -d
+  #
+  # Nothing here is MinIO-specific — MINIO_ARCHIVE_* names an S3 endpoint, and any
+  # S3-compatible server will do. If you already run one, skip this service and
+  # point the consumer at it.
+  # ------------------------------------------------------------------------- #
+  objectstore:
+    profiles: ["media"]
+    image: versity/versitygw:latest
+    # VersityGW in front of a plain directory: one binary, credentials given
+    # explicitly, no user/policy bootstrap step. `_minio.py`'s S3 client talks to
+    # it unchanged — it is path-style, and nothing here is MinIO-specific.
+    command:
+      - --port
+      - ":9000"
+      - --access
+      - ${MINIO_ARCHIVE_ACCESS_KEY:?set MINIO_ARCHIVE_ACCESS_KEY in .env}
+      - --secret
+      - ${MINIO_ARCHIVE_SECRET_KEY:?set MINIO_ARCHIVE_SECRET_KEY in .env}
+      - posix
+      - /data
+    volumes:
+      - objectdata:/data
+    ports:
+      - "127.0.0.1:9000:9000"   # loopback only
+    restart: unless-stopped
+    # ⚠ There is deliberately NO healthcheck and no consumer `depends_on` here.
+    # The archive works without this service — message rows are stored either way
+    # and an attachment is recorded as failed if the store is unreachable — so a
+    # dependency would only make the default stack harder to start.
+    #
+    # ⚠ This convenience profile uses ONE credential as both the gateway's root
+    # user and the archive's access key. A real deployment should scope the
+    # archive to its own bucket rather than handing it a root key.
+
+  # ------------------------------------------------------------------------- #
+  # The linked-device daemon. Holds the WhatsApp session; the consumer and sender
+  # both talk to it, and only the sender is given a user token.
+  # ------------------------------------------------------------------------- #
+  whatsapp-api:
+    image: asternic/wuzapi:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: wuzapi
+      DB_USER: wuzapi
+      DB_PASSWORD: ${WUZAPI_DB_PASSWORD:?set WUZAPI_DB_PASSWORD in .env}
+      DB_SSLMODE: "false"
+      # 🔴 Set BEFORE the first pairing, or the session keys are regenerated on
+      # restart and the link is lost.
+      WUZAPI_ADMIN_TOKEN: ${WUZAPI_ADMIN_TOKEN:?set WUZAPI_ADMIN_TOKEN in .env}
+      WUZAPI_GLOBAL_ENCRYPTION_KEY: ${WUZAPI_GLOBAL_ENCRYPTION_KEY:?set WUZAPI_GLOBAL_ENCRYPTION_KEY in .env}
+      WUZAPI_GLOBAL_HMAC_KEY: ${WHATSAPP_HMAC_KEY:?set WHATSAPP_HMAC_KEY in .env}
+      WUZAPI_GLOBAL_WEBHOOK: http://consumer:8080/hook
+      WEBHOOK_FORMAT: json
+      WEBHOOK_RETRY_ENABLED: "true"
+      WEBHOOK_RETRY_COUNT: "3"
+      WEBHOOK_RETRY_DELAY_SECONDS: "30"
+      # 🔴 `unavailable`, NOT the upstream default of `available`. With
+      # `available` the linked companion announces presence and the operator's OWN
+      # phone can stop receiving push notifications.
+      WUZAPI_AUTO_PRESENCE: unavailable
+      WUZAPI_PORT: "8080"
+      WUZAPI_MEDIA_TMPDIR: /tmp
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback only: the pairing/admin API
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # The READ path. Holds no send token and ships no code that can post a message.
+  # ------------------------------------------------------------------------- #
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      WHATSAPP_PG_DSN: postgresql://whatsapp_app:${WHATSAPP_APP_PASSWORD:?}@postgres:5432/whatsapp
+      WHATSAPP_HMAC_KEY: ${WHATSAPP_HMAC_KEY:?}
+      MINIO_ARCHIVE_ENDPOINT: http://objectstore:9000
+      MINIO_ARCHIVE_ACCESS_KEY: ${MINIO_ARCHIVE_ACCESS_KEY:?}
+      MINIO_ARCHIVE_SECRET_KEY: ${MINIO_ARCHIVE_SECRET_KEY:?}
+      WHATSAPP_INSTANCE: whatsapp-consumer
+      WHATSAPP_HEARTBEAT_PATH: /var/run/whatsapp/heartbeat.json
+      WHATSAPP_MEDIA_CONCURRENCY: "2"
+    volumes:
+      - heartbeat:/var/run/whatsapp
+    healthcheck:
+      # 🔴 The FILE, not the database. "This process is still ticking" is the only
+      # safe liveness input; an idle account legitimately stores nothing for hours.
+      test: ["CMD", "python3", "consumer.py", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------------- #
+  # The SEND path. The only process with a send credential.
+  #
+  # 🔴 NO PORTS, DELIBERATELY. There is no HTTP route that sends, so there is
+  # nothing to expose and `approve` additionally requires an operator-supplied
+  # token that is NOT in this environment. Every act is a `docker compose exec`.
+  # ------------------------------------------------------------------------- #
+  sender:
+    build:
+      context: .
+      dockerfile: Dockerfile.sender
+    depends_on:
+      postgres:
+        condition: service_healthy
+      whatsapp-api:
+        condition: service_started
+    environment:
+      WHATSAPP_PG_DSN: postgresql://whatsapp_app:${WHATSAPP_APP_PASSWORD:?}@postgres:5432/whatsapp
+      WUZAPI_URL: http://whatsapp-api:8080
+      WUZAPI_USER_TOKEN: ${WUZAPI_USER_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  objectdata:
+  heartbeat:

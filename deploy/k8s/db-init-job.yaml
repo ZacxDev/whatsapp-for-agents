@@ -1,0 +1,80 @@
+---
+# Creates the `wuzapi` database on the PostgreSQL server the daemon uses.
+#
+# 🔴 WHY A SEPARATE DATABASE AND NOT A SCHEMA OF THE ARCHIVE DATABASE.
+# wuzapi owns its own tables (the linked-device session, users, events, …) and
+# migrates them itself on startup. Putting them in the archive database's `public`
+# schema would mean (a) two applications share one namespace with no boundary,
+# (b) a `DROP SCHEMA public CASCADE` on the archive takes the linked-device
+# credentials with it, and (c) the backup has to dump one database while excluding
+# another application's tables. A database of its own costs one statement and
+# removes all three.
+#
+# The role used here must be able to CREATE DATABASE, and it is the same broader
+# credential the daemon and the backup job use (`whatsapp-pg-admin`) — the session
+# database is not in the app role's reach, by design.
+#
+# 🔴 A JOB'S POD TEMPLATE IS IMMUTABLE. Editing this file does NOT update an
+# existing Job — the object has to be replaced, and a Kustomize apply of an
+# unchanged name fails. That is what the `-vN` suffix is for: bump it on ANY
+# pod-template change (`-v1` → `-v2`) and leave the old Job behind. It is not
+# versioning of the database, and the number carries no meaning beyond "different
+# template".
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: whatsapp-db-init-v1
+  namespace: whatsapp
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: whatsapp-db-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: db-init
+          image: postgres:16-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for postgres at ${PGHOST}..."
+              until pg_isready -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; do
+                sleep 2
+              done
+              # Idempotent: CREATE DATABASE has no IF NOT EXISTS, and a plain
+              # re-run would fail the Job and red the Kustomization on every
+              # reconcile. The guard is the deterministic form of "run once".
+              if psql -tAc "select 1 from pg_database where datname = 'wuzapi'" | grep -q 1; then
+                echo "database wuzapi already present"
+              else
+                psql -c "CREATE DATABASE wuzapi"
+                echo "database wuzapi created"
+              fi
+              # Belt and braces: prove it exists rather than trusting the branch.
+              psql -tAc "select datname from pg_database where datname = 'wuzapi'"
+          env:
+            - name: PGHOST
+              value: CHANGE-ME-postgres-host
+            # The broader role — see `whatsapp-pg-admin` in secrets.yaml.
+            - name: PGUSER
+              value: CHANGE-ME-pg-admin-role
+            # A maintenance database the role can already connect to; any such
+            # database works, since CREATEDB on the role is what this Job needs.
+            - name: PGDATABASE
+              value: postgres
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-pg-admin
+                  key: password
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

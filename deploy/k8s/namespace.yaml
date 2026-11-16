@@ -1,0 +1,14 @@
+---
+# Every object in this directory lands in this namespace.
+#
+# The namespace name appears inside the in-cluster DNS names the pods use to
+# reach each other (`whatsapp-consumer.whatsapp.svc.cluster.local` in
+# deployment-api.yaml, `whatsapp-api.whatsapp.svc.cluster.local` in
+# deployment-sender.yaml) and in the Secret references. Renaming it is a
+# multi-file change, not a one-line one.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: whatsapp
+  labels:
+    app.kubernetes.io/name: whatsapp

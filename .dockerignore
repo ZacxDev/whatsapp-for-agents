@@ -1,0 +1,31 @@
+# Docker build context hygiene.
+#
+# 🔴 This does NOT exist to save bytes — it exists so a `COPY` cannot pick up
+# something that should never reach a registry. Both Dockerfiles COPY by NAME
+# rather than `COPY . .`, and that is the real control; this is the second one.
+#
+# Keep `tests/`: both images deliberately COPY specific hermetic test files so a
+# build can run them against the modules the image actually installed.
+
+.git
+.github
+.gitignore
+.dockerignore
+
+# Local secrets and env files.
+.env
+.env.*
+
+# Never COPYed, and no business being in a build context.
+docs/
+deploy/
+*.md
+LICENSE
+
+# Build/run artefacts.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.log

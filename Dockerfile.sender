@@ -1,0 +1,49 @@
+# The WhatsApp SENDER image — `sender.py serve`, a tiny operator-driven surface.
+#
+# Build from the REPO ROOT:
+#     docker build -f Dockerfile.sender -t whatsapp-for-agents-sender .
+#
+# 🔴 WHY THIS IS A SEPARATE IMAGE FROM `Dockerfile` (the two MUST NOT merge).
+# The consumer parses arbitrary, internet-influenced payloads. It is built with NO
+# wuzapi user token and no send function, so a parser bug cannot reach a send
+# endpoint — that is the architectural property this split exists to keep. If
+# `sender.py` were added to the consumer image, the consumer would ship send CODE;
+# combined with a token later appearing in its environment by accident, the
+# property would be gone with nothing to notice.
+#
+# So the consumer image COPYs by name and does not list these modules, and this
+# image never lists `consumer.py`. `tests/test_image_split.py` reads BOTH
+# Dockerfiles and fails if either list grows the other's modules — a guard on the
+# RELATIONSHIP, so it fails whichever direction the mistake is in.
+#
+# 🔴 COPY BY NAME, NEVER `COPY . .`.
+
+FROM python:3.12-slim
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# The send half, named individually. No consumer.py, no parser, no webhook, no
+# MinIO: this pod reads drafts and posts messages, and nothing else.
+COPY sender.py       /app/
+COPY _wa_outbound.py /app/
+COPY _wa_db.py       /app/
+
+# The gate's tests ship so a build can run them INSIDE the image — a suite that
+# only ever ran on the host proves things about the host.
+COPY tests/test_outbound.py /app/tests/
+
+ENV HOME=/home/nonroot \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN mkdir -p /home/nonroot && chown -R 65532:65532 /home/nonroot
+USER 65532:65532
+WORKDIR /app
+
+# 🔴 The pod serves ONLY /healthz (so a probe and a Deployment can exist); every
+# act that matters is an operator subcommand — draft, approve, send, reconcile.
+# There is deliberately NO HTTP route that sends, so a stray port-forward cannot
+# mint a message, and `approve` additionally requires WHATSAPP_APPROVAL_TOKEN in
+# the environment.
+CMD ["python3", "/app/sender.py", "serve"]

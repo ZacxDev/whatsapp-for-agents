@@ -1,0 +1,73 @@
+---
+# Applies the `whatsapp` schema (the ARCHIVE) to the archive database.
+#
+# 🔴 THIS JOB RUNS OUR OWN IMAGE, NOT A POSTGRES IMAGE, AND THAT IS THE POINT.
+# The DDL lives ONCE, in `_wa_db.SCHEMA_STATEMENTS`, and this Job simply calls it:
+#
+#     consumer.py init-schema    →    ensure_schema()
+#
+# so there is no second copy of the schema to drift from the code. The consumer
+# also calls `ensure_schema()` on every start, so this Job is a convenience (the
+# schema exists before anything is paired) rather than the only path to it. Every
+# statement is IF NOT EXISTS, so re-running is a no-op.
+#
+# 🔴 A JOB'S POD TEMPLATE IS IMMUTABLE — bump the `-vN` suffix on ANY pod-template
+# change, not only a DDL change, or applying this object fails because the name
+# already exists with a different template. The number means "different template",
+# nothing more.
+#
+# 🔴 IT RUNS AS THE APP ROLE, SO IT CANNOT CREATE THE SCHEMA FROM NOTHING.
+# `whatsapp_app` owns schema `whatsapp` but has no CREATE privilege ON THE
+# DATABASE, and PostgreSQL checks that privilege before taking the
+# `CREATE SCHEMA IF NOT EXISTS` shortcut. On a database where the schema does not
+# exist yet, this Job therefore fails loudly rather than silently doing nothing.
+# The one-time bootstrap — which creates the schema OWNED BY the app role — is in
+# README.md ("Postgres: the role split"). It is done as the app role on purpose:
+# objects the app role creates are the ones `ensure_schema()` must later be able
+# to ALTER, and a schema created by the broader credential would turn the next
+# added column into a crash loop.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: whatsapp-schema-init-v1
+  namespace: whatsapp
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: whatsapp-schema-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: schema-init
+          # The consumer image — `init-schema` is one of its subcommands.
+          image: ghcr.io/example/whatsapp-for-agents-consumer:latest
+          # 🔴 `command` IS REQUIRED, NOT STYLE. The image declares only a CMD and
+          # no ENTRYPOINT, so a bare k8s `args:` REPLACES the image's CMD entirely
+          # and `init-schema` would then be executed AS A BINARY:
+          #   exec: "init-schema": executable file not found in $PATH
+          # Spelling the interpreter out makes this Job independent of whatever
+          # the image's default command becomes.
+          command: ["python3", "/app/consumer.py", "init-schema"]
+          env:
+            - name: WHATSAPP_PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  # 🔴 THE APP ROLE, because this Job is what CREATES schema
+                  # objects: anything it creates is owned by the role that ran it,
+                  # and `ensure_schema()` at consumer start must be able to ALTER
+                  # those objects.
+                  #
+                  # 🔴 A `secretKeyRef` cannot cross namespaces (it resolves in
+                  # this pod's namespace), which is why the DSN Secret sits beside
+                  # the pods.
+                  name: whatsapp-app-db
+                  key: pg-dsn
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

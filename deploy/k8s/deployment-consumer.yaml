@@ -1,0 +1,136 @@
+---
+# The consumer — the ingest half. Owns the `whatsapp` schema (the archive) and the
+# media in the object store. wuzapi pushes to it; it never talks to WhatsApp
+# directly.
+#
+# 🔴 IT HAS NO wuzapi USER TOKEN, AND THAT IS THE POINT OF THE SPLIT.
+# The read-only property is structural: not "we promise not to call the send
+# endpoints", but "this pod holds no credential with which to". Sending lives in
+# `whatsapp-sender`, which is built from a different image (`Dockerfile.sender`)
+# whose file list does not intersect this one's.
+#
+# 🔴 THE WEBHOOK IS THE ONLY WAY IN. There is no queue between wuzapi and this
+# process, so a delivery that arrives while the consumer is down relies on
+# wuzapi's retry (`WEBHOOK_RETRY_*` on the api Deployment) and on WhatsApp holding
+# undelivered messages server-side. That is why a failed write answers HTTP 500
+# rather than 200: the retry is the recovery path, and swallowing it would drop
+# the message permanently.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-consumer
+  namespace: whatsapp
+  labels:
+    app: whatsapp-consumer
+spec:
+  # Single writer against the archive. Concurrent consumers would be safe for
+  # Postgres (the dedupe table is a uniqueness constraint, not application state)
+  # but there is no reason to have two and no ordering guarantee between them.
+  # `Recreate` is the same "never two pods at once" rule the api Deployment
+  # carries — cheaper here, and it keeps the invariant uniform.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: whatsapp-consumer
+  template:
+    metadata:
+      labels:
+        app: whatsapp-consumer
+    spec:
+      containers:
+        - name: consumer
+          # Placeholder. Build with `docker build -t <tag> .` from the repo root
+          # and push the result; 🔴 pin the digest of the pushed image (not the
+          # mutable tag) in a real deployment.
+          image: ghcr.io/example/whatsapp-for-agents-consumer:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # -- Archive. 🔴 THE APP ROLE, not the daemon's credential: this pod
+            # only needs the `whatsapp` schema, and the broader credential can
+            # read the linked-device send tokens in the session database. It
+            # arrives as one DSN (`WHATSAPP_PG_DSN`) rather than discrete parts.
+            - name: WHATSAPP_PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-app-db
+                  key: pg-dsn
+
+            # -- Webhook authentication. 🔴 THE SAME SECRET KEY the daemon takes as
+            # its global key (WUZAPI_GLOBAL_HMAC_KEY), read here under the env name
+            # the consumer expects — one value, two references. ⚠ wuzapi's per-user
+            # signing key is set separately and must equal it; see README.md §5.
+            #
+            # 🔴 A `secretKeyRef` cannot cross namespaces (it is resolved in this
+            # pod's namespace), which is why this Secret lives beside the pods.
+            - name: WHATSAPP_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-auth
+                  key: WUZAPI_GLOBAL_HMAC_KEY
+
+            # -- Media archive.
+            - name: MINIO_ARCHIVE_ENDPOINT
+              value: http://CHANGE-ME-minio-host:9000
+            - name: MINIO_ARCHIVE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-consumer-minio
+                  key: minio-access-key
+            - name: MINIO_ARCHIVE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-consumer-minio
+                  key: minio-secret-key
+
+            # Liveness is the heartbeat FILE, never "recent messages" — an idle
+            # account legitimately produces nothing for hours.
+            - name: WHATSAPP_HEARTBEAT_PATH
+              value: /var/run/whatsapp/heartbeat.json
+            - name: WHATSAPP_INSTANCE
+              value: whatsapp-consumer
+            - name: WHATSAPP_MEDIA_CONCURRENCY
+              value: "2"
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/whatsapp
+          # Readiness gates traffic from wuzapi: until the heartbeat exists the
+          # API should not be pointed at a socket that is not serving.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Liveness reads the same FILE-backed endpoint and depends on nothing
+          # external, so a Postgres or object-store outage degrades ingestion
+          # without taking the process down in a restart loop.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "25m"
+              memory: "160Mi"
+            # Base64 media arrives inside the webhook body, so a 16 MiB video is
+            # a ~21 MiB string held in memory during decode. The headroom over
+            # the request is real, not padding.
+            limits:
+              cpu: "1"
+              memory: "640Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        # The heartbeat file, and nothing that must survive a restart — the
+        # archive is in Postgres and the media is in the object store.
+        - name: run
+          emptyDir: {}

@@ -1,0 +1,128 @@
+---
+# The sender — the ONLY component that can post a message as the operator.
+#
+# 🔴 WHY THIS IS A SEPARATE DEPLOYMENT (and not an env var on the consumer).
+# `whatsapp-consumer` parses arbitrary, internet-influenced payloads and is built
+# with NO wuzapi user token, so that a parser bug cannot reach a send endpoint.
+# That property is kept rather than spent: the token lives in THIS pod only, and
+# the code that uses it is a separate image (`Dockerfile.sender`) whose file list
+# does not intersect the consumer's. `tests/test_image_split.py` fails if either
+# image grows the other's modules.
+#
+# 🔴 THE TOKEN IS THE PAIRED SESSION'S, AND THERE IS EXACTLY ONE SESSION.
+# Minting a second wuzapi user would create a SECOND LINKED DEVICE, and two
+# clients on one device identity is what WhatsApp reads as a compromise — the same
+# reason `whatsapp-api` is `replicas: 1` + `Recreate`. So this pod reuses the one
+# session's token; it does not get an identity of its own, and it is never scaled.
+#
+# 🔴 A REPLY-ONLY CAPABILITY IS ENFORCED IN CODE, NOT HERE. This pod can address
+# any JID it is given; what stops it being used to initiate is that a draft must be
+# created and then approved by a human (`approve` requires WHATSAPP_APPROVAL_TOKEN,
+# which is deliberately NOT in this Deployment's environment — see the env block).
+#
+# 🔴 NO SERVICE. The pod serves /healthz for its probes and nothing else; every act
+# that matters is an operator `kubectl exec`. There is deliberately no HTTP route
+# that sends, so a stray `port-forward` cannot mint a message.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-sender
+  namespace: whatsapp
+  labels:
+    app: whatsapp-sender
+spec:
+  # One sender. Two would race for the same draft, and the claim is a conditional
+  # UPDATE so the loser would fail loudly rather than double-send — but there is no
+  # reason to have two, and `Recreate` keeps the "never two pods at once" rule that
+  # the shared device identity requires.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: whatsapp-sender
+  template:
+    metadata:
+      labels:
+        app: whatsapp-sender
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # 🔴 BOTH. `runAsNonRoot` without `runAsUser` lets the kubelet pick, and
+        # this image's USER is 65532 — a mismatch there is the
+        # "container has runAsNonRoot and image has non-numeric user" failure.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sender
+          # Placeholder. Build with `docker build -f Dockerfile.sender -t <tag> .`
+          # from the repo root; 🔴 pin the digest of the pushed image (not the
+          # mutable tag) in a real deployment.
+          image: ghcr.io/example/whatsapp-for-agents-sender:latest
+          # 🔴 `command` IS REQUIRED, NOT STYLE. The image declares a CMD and no
+          # ENTRYPOINT, so a bare k8s `args:` REPLACES the image's CMD entirely
+          # and `serve` would then be executed AS A BINARY:
+          #   exec: "serve": executable file not found in $PATH
+          # Spelling the interpreter out also makes this independent of whatever
+          # the image's default command becomes.
+          command: ["python3", "/app/sender.py", "serve"]
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: WUZAPI_URL
+              value: http://whatsapp-api.whatsapp.svc.cluster.local:8080
+            # The send credential. This is the ONLY pod that holds it.
+            - name: WUZAPI_USER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-sender-auth
+                  key: WUZAPI_USER_TOKEN
+            # 🔴 THE APP ROLE, not the daemon's credential — the sender writes
+            # `whatsapp.*` only, and holding the broader credential would
+            # undermine the very split this pod exists to keep.
+            #
+            # 🔴 A `secretKeyRef` cannot cross namespaces (it resolves in this
+            # pod's namespace), which is why the Secret sits beside the pods.
+            - name: WHATSAPP_PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-app-db
+                  key: pg-dsn
+            - name: WHATSAPP_SENDER_HEARTBEAT
+              value: /tmp/whatsapp-sender-ok
+            # 🔴 WHATSAPP_APPROVAL_TOKEN IS DELIBERATELY ABSENT.
+            # `approve` and `unapprove` refuse without it; that is the human step.
+            # If the token were in this pod's environment then anything that can
+            # exec here (an agent included) could approve its own draft, and the
+            # gate would be decorative. The operator supplies it on the
+            # `kubectl exec` that approves. It exists as a key in
+            # `whatsapp-sender-auth`, unreferenced by this file.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 20
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 60
+          resources:
+            requests:
+              cpu: 10m
+              memory: 48Mi
+            limits:
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # false because the heartbeat file is written under /tmp. If you set
+            # this true, mount an emptyDir at /tmp as well or the heartbeat (and
+            # with it the liveness probe) fails.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
