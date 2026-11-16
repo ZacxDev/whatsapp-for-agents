@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # The bootstrap script's inputs — see deploy/postgres/init/01-databases.sh.
+      # These are throwaway CI credentials on an ephemeral runner, not secrets.
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      POSTGRES_USER: postgres
+      WHATSAPP_APP_PASSWORD: ci-app-password
+      WUZAPI_DB_PASSWORD: ci-wuzapi-password
+      WHATSAPP_TEST_DSN: postgresql://whatsapp_app:ci-app-password@127.0.0.1:5432/whatsapp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      # 🔴 THE SAME SCRIPT THE COMPOSE STACK RUNS, so CI exercises the role split
+      # rather than a CI-shaped shortcut. Two databases, one role each, PUBLIC's
+      # CONNECT revoked — that is the property that keeps the archive role out of
+      # the linked-device session, and it should not be able to rot unnoticed.
+      - name: Bootstrap databases and the role split
+        run: bash deploy/postgres/init/01-databases.sh
+
+      - name: Prove the role split still holds
+        run: |
+          # Positive control: the archive role reaches its own database.
+          psql "postgresql://whatsapp_app:${WHATSAPP_APP_PASSWORD}@127.0.0.1:5432/whatsapp" \
+            -Atc 'select current_database()'
+          # Negative control: and is REFUSED on the session store. If this
+          # succeeds, the split is gone — fail loudly rather than print a warning.
+          if psql "postgresql://whatsapp_app:${WHATSAPP_APP_PASSWORD}@127.0.0.1:5432/wuzapi" \
+              -Atc 'select 1' >/dev/null 2>&1; then
+            echo "::error::the archive role can reach wuzapi — the role split is broken"
+            exit 1
+          fi
+          echo "role split holds"
+
+      # 🔴 ZERO SKIPS IS ENFORCED, not asserted in a README. The two DSN-gated
+      # suites carry the SQL-wiring coverage a hermetic test structurally cannot
+      # reach, and an import guard in these modules once turned a FAILURE into a
+      # SKIP — which left the suite green. A step that counts them is what stops
+      # that happening again.
+      - name: Run the suite (hermetic + live Postgres)
+        run: |
+          set -o pipefail
+          python -m pytest tests -q -rs | tee /tmp/pytest.txt
+          if grep -qE '^SKIPPED' /tmp/pytest.txt; then
+            echo "::error::a test module skipped — expected 0 skips with WHATSAPP_TEST_DSN set"
+            exit 1
+          fi

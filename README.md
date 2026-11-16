@@ -1,5 +1,7 @@
 # whatsapp-for-agents
 
+[![ci](https://github.com/ZacxDev/whatsapp-for-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/ZacxDev/whatsapp-for-agents/actions/workflows/ci.yml)
+
 **Your WhatsApp history, in Postgres, queryable — with sending that a human has to approve.**
 
 WhatsApp has no API for this. There is no export, no search endpoint, no way to ask
@@ -65,7 +67,7 @@ Design notes live in [`docs/`](./docs/).
 ## Quickstart
 
 ```bash
-git clone <this repo> && cd whatsapp-for-agents
+git clone https://github.com/ZacxDev/whatsapp-for-agents && cd whatsapp-for-agents
 cp .env.example .env        # ⚠ fill it in — never reuse the CHANGE-ME values
 
 docker compose up -d postgres
